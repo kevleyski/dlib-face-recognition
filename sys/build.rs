@@ -1,3 +1,11 @@
+extern crate core;
+
+use std::env;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+
+use fs_extra::dir::CopyOptions;
+
 #[cfg(feature = "build")]
 fn download_and_unzip(version: &str) -> std::path::PathBuf {
     let url = format!("http://dlib.net/files/dlib-{}.zip", version);
@@ -31,6 +39,22 @@ fn main() {
     let version_minor = env!("CARGO_PKG_VERSION_MINOR");
     let version_dlib = format!("{}.{}", version_major, version_minor);
 
+    // Download
+    let src = download_and_unzip(&version_dlib);
+    build_dlib(&src);
+}
+
+fn build_dlib(src: &PathBuf) {
+    let target = env::var("TARGET").unwrap();
+
+    if target.contains("x86_64-pc-windows-msvc") {
+        build_dlib_on_windows(src)
+    } else {
+        build_dlib_on_unixlike(src)
+    }
+}
+
+fn build_dlib_on_unixlike(src: &Path) {
     // Try probing
     if let Ok(library) = pkg_config::Config::new()
         .print_system_cflags(false)
@@ -52,9 +76,6 @@ fn main() {
         write_paths("include", library.include_paths);
         return;
     }
-
-    // Download
-    let src = download_and_unzip(&version_dlib);
 
     // Build
     let dst = cmake::Config::new(src.join("examples"))
@@ -84,7 +105,7 @@ fn main() {
     .filter_map(Result::ok)
     .next()
     .expect("Failed to find library file");
-    std::fs::create_dir_all(&dst_lib).unwrap();
+    std::fs::create_dir_all(dst_lib).unwrap();
     std::fs::copy(
         &src_lib,
         dst_lib.join(format!("{}dlib.{}", &src_lib_prefix, &src_lib_suffix)),
@@ -107,6 +128,78 @@ fn main() {
     // Link
     println!("cargo:root={}", dst.display());
     println!("cargo:include={}", dst_include.display());
+}
+
+fn build_dlib_on_windows(src: &PathBuf) {
+    let dst = cmake::Config::new(src)
+        .no_build_target(false)
+        .define("CMAKE_INSTALL_PREFIX", "install")
+        .build();
+
+    // Copy the library file
+    let dst_lib = &dst;
+    let src_lib_dir = dst.join("build").join("install");
+    std::fs::create_dir_all(dst.join("lib")).unwrap();
+    std::fs::create_dir_all(dst.join("include")).unwrap();
+
+    fs_extra::dir::copy(
+        src_lib_dir.join("lib"),
+        &dst,
+        &CopyOptions {
+            skip_exist: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    fs_extra::dir::copy(
+        src_lib_dir.join("include"),
+        &dst,
+        &CopyOptions {
+            skip_exist: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // modify file name only on windows msvc tool chain.
+    modify_dlib_msvc_filename(&dst);
+
+    let out_dir = env::var("OUT_DIR").unwrap();
+
+    std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let dlib = PathBuf::from(out_dir.clone()).join("lib");
+    println!("cargo:rustc-link-search=native={}", out_dir);
+    println!("cargo:rustc-flags=-L {}", dlib.display());
+    println!("cargo:rustc-flags=-L {}", out_dir);
+    println!("cargo:root={}", out_dir);
+    println!("cargo:include={}", dst_lib.join("include").display());
+    println!("cargo:rustc-link-lib=static=dlib");
+}
+
+fn modify_dlib_msvc_filename(dst: &Path) {
+    let src_lib_prefix = if cfg!(windows) { "" } else { "lib" };
+    let src_lib_suffix = if cfg!(windows) { "lib" } else { "a" };
+    let target = env::var("TARGET").unwrap();
+    if target.contains("x86_64-pc-windows-msvc") {
+        let src_lib_path = glob::glob(&format!(
+            "{}/{}dlib*.{}",
+            dst.join("lib").display(),
+            &src_lib_prefix,
+            &src_lib_suffix
+        ))
+        .expect("Failed to read glob pattern")
+        .into_iter()
+        .filter_map(Result::ok)
+        .next();
+        if let Some(source) = src_lib_path {
+            let dlib_modified_name = dst
+                .join("lib")
+                .join(format!("{}dlib.{}", &src_lib_prefix, &src_lib_suffix));
+            File::create(dlib_modified_name.clone()).unwrap();
+            std::fs::copy(source, dlib_modified_name).unwrap();
+        }
+    };
 }
 
 #[cfg(not(feature = "build"))]
